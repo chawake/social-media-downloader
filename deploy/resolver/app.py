@@ -28,8 +28,8 @@ from urllib.parse import quote, urlparse
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.background import BackgroundTask
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from yt_dlp import YoutubeDL
 
 # Disable Swagger UI, ReDoc, and OpenAPI endpoints in production

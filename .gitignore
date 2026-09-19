@@ -52,3 +52,5 @@ next-env.d.ts
 .zcode/
 .prof/
 .worker-size-check/
+__pycache__/
+*.pyc

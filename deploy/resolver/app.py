@@ -1,146 +1,95 @@
 """
-Generic media resolver — a small, self-hosted tunnel service that speaks the
-same request/response shape as the public Cobalt API, so the main app can use it
-as a drop-in fallback via the COBALT_API_URL env var (comma/space separated list).
-
-Why it exists: the public tunnel API only resolves a fixed set of platforms. For
-any other well-formed link, the app now routes to this service. It resolves the
-media server-side and then *tunnels* the bytes through this box, so the resulting
-URL streams from any IP (the same trick that makes datacenter playback work) —
-raw CDN URLs are usually signed against the extracting session and 403 elsewhere.
+Media Resolver Microservice for JapiAgent.
+Self-hosted service with FastAPI + yt-dlp + FFmpeg deployed via Docker on Coolify.
 
 Endpoints:
-  POST /            Cobalt-shaped. Body: {url, downloadMode?, videoQuality?}.
-                    Returns {status:"tunnel", url, filename} or {status:"error"}.
-  GET  /t?d=<tok>   Streams the resolved media (Range-aware for progressive http).
-  GET  /html?url=   Returns a page's raw markup, fetched from this box's IP.
-  GET  /health      Liveness probe / keep-warm ping target.
+  POST /extract-video  Extracts video from TikTok and Instagram Reels.
+  GET  /t?d=<tok>      Streams the resolved media with HMAC-SHA256 signed token + 15m expiration.
+  GET  /health         Health check and liveness probe.
 """
 
 import base64
+from datetime import datetime, timezone
+import glob
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
 import secrets
+import shutil
+import socket
 import subprocess
+import tempfile
 import time
 from typing import Any, Optional
-
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.background import BackgroundTask
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from yt_dlp import YoutubeDL
 
-app = FastAPI()
-
-# Public base URL of this service. Different hosts expose it differently:
-# Render injects RENDER_EXTERNAL_URL; other platforms expose the bare host via
-# SPACE_HOST or KOYEB_PUBLIC_DOMAIN. Falls back to an explicit BASE_URL env, then
-# localhost for dev. Set BASE_URL manually if your host isn't auto-detected.
-_host_only = (
-    os.environ.get("SPACE_HOST", "").strip()
-    or os.environ.get("KOYEB_PUBLIC_DOMAIN", "").strip()
+# Disable Swagger UI, ReDoc, and OpenAPI endpoints in production
+app = FastAPI(
+    title="Japi Media Resolver",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
+
+MAX_DURATION_SECONDS = 90
+MAX_BYTES = 104_857_600  # 100 MB
+TOKEN_TTL_SECONDS = 900  # 15 minutes
+ALLOWED_SOURCE_HOSTS = {
+    "tiktok.com",
+    "instagram.com",
+    "youtube.com",
+    "youtu.be",
+}
+
 BASE_URL = (
-    os.environ.get("RENDER_EXTERNAL_URL")
-    or (f"https://{_host_only}" if _host_only else "")
-    or os.environ.get("BASE_URL")
+    os.environ.get("BASE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
     or "http://localhost:8080"
 ).rstrip("/")
 
 
 def _public_base(request: Request) -> str:
-    """Playback host for tunnel links. Prefer the host the request actually
-    arrived on (via the reverse proxy's forwarded headers) so a platform that
-    hands out a rotating/temporary public URL still emits reachable links with
-    no BASE_URL churn. Fall back to the configured BASE_URL for local/dev."""
     forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     if forwarded_host:
         host = forwarded_host.split(",")[0].strip()
-        # The public edge terminates TLS, so the internet-facing URL is always
-        # https even though the internal hop to the container is plain http
-        # (x-forwarded-proto reflects that inner hop). Force https for any real
-        # forwarded host to avoid emitting a mixed-content link; keep http only
-        # for a bare localhost dev origin.
         proto = "http" if host.split(":")[0] in ("localhost", "127.0.0.1") else "https"
         return f"{proto}://{host}".rstrip("/")
     return BASE_URL
 
-# Optional shared key. When set, callers must send `Authorization: Api-Key <key>`
-# (the main app forwards COBALT_API_KEY this way). Tunnel tokens are always HMAC
-# signed so /t can't be abused as an open proxy for arbitrary URLs.
-API_KEY = os.environ.get("RESOLVER_API_KEY", "").strip()
-SECRET = (os.environ.get("RESOLVER_SECRET", "").strip() or secrets.token_hex(16)).encode()
 
-# Optional cookies.txt contents (Netscape format), for links that gate behind a
-# login / anti-bot check. Either paste the file into RESOLVER_COOKIES, or — when
-# the file is too big for a host's env-var size cap, or the host mangles the
-# required tabs/newlines — point RESOLVER_COOKIES_URL at a raw URL (e.g. a secret
-# Gist) and it's fetched once at boot. Written to disk either way.
+API_KEY = os.environ.get("RESOLVER_API_KEY", "").strip()
+RESOLVER_SECRET = os.environ.get("RESOLVER_SECRET", "").strip()
+
+# Enforce explicit credentials in production (fail-fast on startup)
+IS_LOCAL = os.environ.get("ENV", "").lower() in ("local", "dev", "development") or BASE_URL.startswith("http://localhost")
+
+if not IS_LOCAL:
+    if not API_KEY:
+        raise RuntimeError("FATAL: RESOLVER_API_KEY environment variable is required in production.")
+    if not RESOLVER_SECRET:
+        raise RuntimeError("FATAL: RESOLVER_SECRET environment variable is required in production.")
+
+SECRET = (RESOLVER_SECRET or secrets.token_hex(32)).encode()
+
+# Optional cookies for restricted sources
 COOKIEFILE: Optional[str] = None
 _cookies = os.environ.get("RESOLVER_COOKIES", "")
-_cookies_url = os.environ.get("RESOLVER_COOKIES_URL", "").strip()
-if not _cookies.strip() and _cookies_url:
-    try:
-        _resp = requests.get(_cookies_url, timeout=15)
-        if _resp.status_code < 400 and _resp.text.strip():
-            _cookies = _resp.text
-    except Exception:
-        pass
 if _cookies.strip():
     COOKIEFILE = "/tmp/cookies.txt"
     with open(COOKIEFILE, "w", encoding="utf-8") as fh:
         fh.write(_cookies)
 
-# Optional upstream proxy. Some sources geo-restrict by the *client* IP and
-# redirect datacenter egress to a notice/gate page (cookies can't fix that).
-# Set RESOLVER_PROXY to a proxy URL (http(s)/socks5) in a region the source
-# serves, and every fetch — extraction, the pipe path, and the /t upstream
-# stream — routes through it.
 PROXY = os.environ.get("RESOLVER_PROXY", "").strip()
 
-# Self-registration: hosts on some free tiers hand out a rotating/temporary
-# public URL, and expose no API to read the current one — so the app can't be
-# told where to reach this box. Instead, this box announces its own live URL to
-# a tiny shared key/value store on each liveness ping and resolve. The app reads
-# that key to discover the current URL, so rotation heals automatically with no
-# manual env churn. Credentials live only in the host env (never in the repo).
-_REG_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
-_REG_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
-_REG_KEY = os.environ.get("REGISTRY_KEY", "resolver_url").strip() or "resolver_url"
-# The stored value expires if this box stops announcing (dies / is replaced), so
-# the app stops handing out a dead URL. Kept well above the keep-warm cadence.
-_REG_TTL = 900
-_reg_state: dict[str, Any] = {"base": None, "t": 0.0}
-
-
-def _register(base: str) -> None:
-    """Publish this box's current public base URL to the shared store. No-op when
-    the store isn't configured. De-duped: only writes on a changed URL or once
-    the prior write is stale enough that the TTL needs refreshing."""
-    if not _REG_URL or not _REG_TOKEN or not base:
-        return
-    now = time.monotonic()
-    if base == _reg_state["base"] and (now - _reg_state["t"]) < (_REG_TTL / 2):
-        return
-    try:
-        requests.post(
-            _REG_URL,
-            json=["SET", _REG_KEY, base, "EX", _REG_TTL],
-            headers={"Authorization": f"Bearer {_REG_TOKEN}"},
-            timeout=8,
-        )
-        _reg_state["base"] = base
-        _reg_state["t"] = now
-    except Exception:
-        pass
-
-# Best-effort browser impersonation (needs curl_cffi) to clear TLS/anti-bot
-# fingerprint checks on the stricter sources.
 try:
     from yt_dlp.networking.impersonate import ImpersonateTarget
 
@@ -155,6 +104,7 @@ def _base_opts() -> dict:
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
+        "max_filesize": MAX_BYTES,
     }
     if COOKIEFILE:
         opts["cookiefile"] = COOKIEFILE
@@ -168,8 +118,6 @@ def _base_opts() -> dict:
 def _format_for(audio: bool, quality: Optional[str]) -> str:
     if audio:
         return "bestaudio/best"
-    # Prefer a single progressive http(s) rendition — it proxies with Range
-    # (seekable preview) and needs no merge. Fall back to anything.
     if quality == "480":
         return (
             "best[height<=480][ext=mp4][protocol^=http]/"
@@ -179,8 +127,9 @@ def _format_for(audio: bool, quality: Optional[str]) -> str:
 
 
 def _sign(payload: dict) -> str:
-    raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-    sig = hmac.new(SECRET, raw.encode(), hashlib.sha256).hexdigest()[:16]
+    raw = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    # Full 64-char HMAC-SHA256 signature
+    sig = hmac.new(SECRET, raw.encode(), hashlib.sha256).hexdigest()
     return f"{raw}.{sig}"
 
 
@@ -189,14 +138,26 @@ def _unsign(token: str) -> Optional[dict]:
         raw, sig = token.rsplit(".", 1)
     except ValueError:
         return None
-    expect = hmac.new(SECRET, raw.encode(), hashlib.sha256).hexdigest()[:16]
+
+    expect = hmac.new(SECRET, raw.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig, expect):
         return None
+
     pad = "=" * (-len(raw) % 4)
     try:
-        return json.loads(base64.urlsafe_b64decode(raw + pad))
+        data = json.loads(base64.urlsafe_b64decode(raw + pad))
     except Exception:
         return None
+
+    if not isinstance(data, dict):
+        return None
+
+    # Strict expiration check: tokens without exp or expired tokens are rejected
+    exp = data.get("exp")
+    if not exp or not isinstance(exp, (int, float)) or time.time() > exp:
+        return None
+
+    return data
 
 
 def _safe_name(title: str, ext: str) -> str:
@@ -205,20 +166,42 @@ def _safe_name(title: str, ext: str) -> str:
 
 
 def _disposition(filename: str) -> str:
-    """Build a Content-Disposition value that is safe for a latin-1 HTTP header.
-    Non-latin-1 chars (emoji, curly quotes, CJK) would make the ASGI server throw
-    on header encode, so we send an ASCII-only fallback plus an RFC 5987
-    `filename*` carrying the real UTF-8 name."""
     ascii_name = filename.encode("ascii", "ignore").decode("ascii").strip() or "media"
     encoded = quote(filename, safe="")
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
 
 
 _LAST_ERR: str = ""
+_LAST_ERROR_CODE: str = ""
+_LAST_ERROR_DURATION: int = 0
+
+
+def _validate_source_url(url: str) -> Optional[str]:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+
+    if parsed.scheme != "https" or not host:
+        return "Only HTTPS source URLs are supported"
+
+    if not any(host == allowed or host.endswith(f".{allowed}") for allowed in ALLOWED_SOURCE_HOSTS):
+        return "Only public TikTok, Instagram, and YouTube URLs are supported"
+
+    try:
+        addresses = {record[4][0] for record in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+    except socket.gaierror:
+        return "Could not resolve the source host"
+
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        return "The source host resolves to a non-public address"
+
+    return None
 
 
 def _extract(url: str, audio: bool, quality: Optional[str]) -> Optional[dict]:
-    global _LAST_ERR
+    global _LAST_ERR, _LAST_ERROR_CODE, _LAST_ERROR_DURATION
+    _LAST_ERR = ""
+    _LAST_ERROR_CODE = ""
+    _LAST_ERROR_DURATION = 0
     opts = _base_opts()
     opts["format"] = _format_for(audio, quality)
     try:
@@ -226,21 +209,38 @@ def _extract(url: str, audio: bool, quality: Optional[str]) -> Optional[dict]:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         _LAST_ERR = f"{type(exc).__name__}: {exc}"
+        _LAST_ERROR_CODE = "resolution_failed"
         return None
     if not info:
         return None
-    # A playlist/multi-entry result — take the first playable entry.
+
     if info.get("_type") == "playlist" and info.get("entries"):
         entries = [e for e in info["entries"] if e]
         if not entries:
             return None
         info = entries[0]
 
+    # Pre-check 1: Duration limit (max 90s)
+    duration = int(info.get("duration") or 0)
+    if duration > MAX_DURATION_SECONDS:
+        _LAST_ERR = f"Duration {duration}s exceeds {MAX_DURATION_SECONDS}s limit for reference videos"
+        _LAST_ERROR_CODE = "duration_exceeded"
+        _LAST_ERROR_DURATION = duration
+        return None
+
+    # Pre-check 2: Filesize limit (max 100 MB) if known ahead of time
+    filesize = info.get("filesize") or info.get("filesize_approx")
+    if filesize and filesize > MAX_BYTES:
+        _LAST_ERR = f"File size {filesize} bytes exceeds {MAX_BYTES} bytes (100 MB) limit"
+        _LAST_ERROR_CODE = "size_exceeded"
+        return None
+
     protocol = str(info.get("protocol") or "")
     direct = info.get("url")
     progressive = bool(direct) and protocol.startswith("http") and "m3u8" not in protocol
     return {
         "title": info.get("title") or "media",
+        "duration": duration,
         "direct": direct,
         "headers": info.get("http_headers") or {},
         "ext": "mp3" if audio else (info.get("ext") or "mp4"),
@@ -250,105 +250,35 @@ def _extract(url: str, audio: bool, quality: Optional[str]) -> Optional[dict]:
 
 def _authorized(request: Request) -> bool:
     if not API_KEY:
-        return True
-    return request.headers.get("authorization", "") == f"Api-Key {API_KEY}"
+        return IS_LOCAL
+    auth = request.headers.get("authorization", "").strip()
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+    elif auth.startswith("Api-Key "):
+        token = auth[8:].strip()
+    else:
+        token = auth
+    return hmac.compare_digest(token, API_KEY)
 
 
 @app.get("/health")
-@app.get("/")
 def health(request: Request) -> JSONResponse:
-    # `auth` reports whether a cookie jar was loaded at boot (no contents), so a
-    # misconfigured cookie source can be diagnosed without shipping secrets.
-    # Announce the live URL on every keep-warm ping — this is the steady heartbeat
-    # that keeps the app's discovery key fresh (and refreshes its TTL).
-    _register(_public_base(request))
-    # `registry` reports whether self-registration is wired (store URL + token
-    # present) — confirms this build + its env without leaking any secret value.
     out: dict[str, Any] = {
         "status": "ok",
+        "service": "japi-media-resolver",
         "auth": bool(COOKIEFILE),
         "proxy": bool(PROXY),
-        "registry": bool(_REG_URL and _REG_TOKEN),
+        "max_duration": MAX_DURATION_SECONDS,
+        "max_bytes": MAX_BYTES,
     }
-    # `?geo=1` reports the effective egress region (through the proxy if set), so
-    # a source that geo-restricts by client IP can be diagnosed.
-    if request.query_params.get("geo"):
-        proxies = {"http": PROXY, "https": PROXY} if PROXY else None
-        try:
-            r = requests.get("https://ipinfo.io/json", timeout=10, proxies=proxies)
-            j = r.json()
-            out["geo"] = {k: j.get(k) for k in ("ip", "city", "region", "country")}
-        except Exception as exc:
-            out["geo"] = f"lookup failed: {type(exc).__name__}"
     return JSONResponse(out)
 
 
-# Page fetch, for sites that answer a datacenter IP with a redirect stub instead
-# of their real markup while returning the page normally to a residential one.
-# The block is on the IP, so nothing the app can send fixes it from a Worker —
-# but this box is wherever you run it, and run at home its egress is residential.
-#
-# GET rather than POST, and the key travels in the query string rather than a
-# header, because the app reaches this through SCRAPE_UNLOCKER_URL — a plain URL
-# template with no place to put headers. Keep the URL a secret accordingly; on a
-# tunnel with a random hostname it is not guessable, and the key is still checked.
-#
-# Only HTML comes back, capped: the caller wants tags out of a <head>, and a
-# resolver is not a media proxy — the tunnel path above is what streams bytes.
-HTML_MAX_BYTES = 262_144
-HTML_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-)
-
-
-@app.get("/html")
-def html(request: Request) -> Any:
-    key = request.query_params.get("key", "")
-    if API_KEY and not hmac.compare_digest(key, API_KEY):
-        return JSONResponse({"error": "auth"}, status_code=401)
-
-    target = request.query_params.get("url", "")
-    if not target.startswith(("http://", "https://")):
-        return JSONResponse({"error": "url"}, status_code=400)
-
-    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
-    try:
-        # stream=True so a link that turns out to be a 4 GB video is capped at
-        # HTML_MAX_BYTES instead of pulled into memory before the check.
-        resp = requests.get(
-            target,
-            timeout=20,
-            proxies=proxies,
-            stream=True,
-            allow_redirects=True,
-            headers={
-                "User-Agent": HTML_UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-    except Exception as exc:
-        return JSONResponse({"error": type(exc).__name__}, status_code=502)
-
-    with resp:
-        if resp.status_code >= 400:
-            return JSONResponse({"error": "upstream"}, status_code=502)
-        body = resp.raw.read(HTML_MAX_BYTES, decode_content=True) or b""
-
-    charset = resp.encoding or "utf-8"
-    return Response(
-        content=body.decode(charset, errors="replace"),
-        media_type="text/html; charset=utf-8",
-    )
-
-
-@app.post("/")
-async def resolve(request: Request) -> JSONResponse:
+@app.post("/extract-video")
+async def extract_video(request: Request) -> JSONResponse:
     if not _authorized(request):
-        return JSONResponse({"status": "error", "error": {"code": "auth"}}, status_code=401)
-    # Keep the discovery key current even if keep-warm pings lapse.
-    _register(_public_base(request))
+        return JSONResponse({"status": "error", "error": "Unauthorized"}, status_code=401)
+
     try:
         body = await request.json()
     except Exception:
@@ -356,25 +286,37 @@ async def resolve(request: Request) -> JSONResponse:
 
     url = (body or {}).get("url")
     if not url or not isinstance(url, str):
-        return JSONResponse({"status": "error", "error": {"code": "link.invalid"}})
+        return JSONResponse({"status": "error", "error": "Invalid URL provided"}, status_code=400)
+
+    url_error = _validate_source_url(url)
+    if url_error:
+        return JSONResponse({"status": "error", "error": {"code": "invalid_source", "message": url_error}}, status_code=400)
 
     audio = (body or {}).get("downloadMode") == "audio"
     quality = (body or {}).get("videoQuality")
 
     meta = _extract(url, audio, quality)
     if not meta or (not meta["direct"] and not meta["progressive"] and not audio):
-        # Nothing resolvable here — let the caller fall through to its next path.
-        err: dict[str, Any] = {"status": "error", "error": {"code": "fetch.empty"}}
-        if (body or {}).get("debug") and _LAST_ERR:
-            err["detail"] = _LAST_ERR
-        return JSONResponse(err)
+        error_msg = _LAST_ERR or "Could not resolve video stream"
+        error = {"code": _LAST_ERROR_CODE or "resolution_failed", "message": error_msg}
+        if _LAST_ERROR_DURATION:
+            error["duration_seconds"] = _LAST_ERROR_DURATION
+        return JSONResponse({"status": "error", "error": error}, status_code=422)
 
-    token = _sign({"u": url, "a": 1 if audio else 0, "q": quality or ""})
+    exp_timestamp = int(time.time()) + TOKEN_TTL_SECONDS
+    expires_at = datetime.fromtimestamp(exp_timestamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    token = _sign({"u": url, "a": 1 if audio else 0, "q": quality or "", "exp": exp_timestamp})
+    tunnel_url = f"{_public_base(request)}/t?d={token}"
+
+    # Return clean, unified contract expected by Laravel
     return JSONResponse(
         {
-            "status": "tunnel",
-            "url": f"{_public_base(request)}/t?d={token}",
-            "filename": _safe_name(meta["title"], meta["ext"]),
+            "media_url": tunnel_url,
+            "mime_type": "audio/mpeg" if audio else "video/mp4",
+            "duration_seconds": meta.get("duration", 0),
+            "expires_at": expires_at,
+            "title": meta.get("title", "media"),
         }
     )
 
@@ -386,8 +328,6 @@ _CORS = {
 
 
 def _pipe(url: str, audio: bool, quality: Optional[str]):
-    """Fallback for audio / non-progressive (HLS/DASH) media: let yt-dlp fetch,
-    remux, and write to stdout. No Range (single 200 response)."""
     fmt = _format_for(audio, quality)
     cmd = ["yt-dlp", "-f", fmt, "-o", "-", "--no-playlist", "--quiet"]
     if audio:
@@ -402,81 +342,83 @@ def _pipe(url: str, audio: bool, quality: Optional[str]):
         cmd += ["--impersonate", "chrome"]
     cmd.append(url)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    bytes_sent = 0
     try:
         while True:
             chunk = proc.stdout.read(65536)
             if not chunk:
                 break
+            bytes_sent += len(chunk)
+            if bytes_sent > MAX_BYTES:
+                # Abort immediately: do not deliver a corrupt oversized partial file
+                proc.kill()
+                raise HTTPException(status_code=422, detail="Stream exceeded 100 MB limit")
             yield chunk
     finally:
         proc.stdout.close()
         proc.kill()
 
 
+def _download_limited_file(url: str, quality: Optional[str]) -> tuple[str, str]:
+    temp_dir = tempfile.mkdtemp(prefix="japi_reference_")
+    output_template = os.path.join(temp_dir, "reference.%(ext)s")
+    downloaded = 0
+
+    def progress(status: dict) -> None:
+        nonlocal downloaded
+        downloaded = int(status.get("downloaded_bytes") or downloaded)
+        if downloaded > MAX_BYTES:
+            raise RuntimeError("Video exceeds 100 MB limit")
+
+    options = _base_opts()
+    options.update({
+        "skip_download": False,
+        "format": _format_for(False, quality),
+        "outtmpl": output_template,
+        "progress_hooks": [progress],
+        "merge_output_format": "mp4",
+    })
+
+    try:
+        with YoutubeDL(options) as ydl:
+            ydl.extract_info(url, download=True)
+
+        files = [path for path in glob.glob(os.path.join(temp_dir, "reference.*")) if os.path.isfile(path)]
+        if len(files) != 1 or os.path.getsize(files[0]) == 0:
+            raise RuntimeError("Could not create a complete reference video file")
+        if os.path.getsize(files[0]) > MAX_BYTES:
+            raise RuntimeError("Video exceeds 100 MB limit")
+
+        return files[0], temp_dir
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
 @app.get("/t")
 def tunnel(d: str, request: Request) -> Any:
     data = _unsign(d)
     if not data:
-        return JSONResponse({"error": "bad token"}, status_code=403)
+        return JSONResponse({"error": "Bad or expired token"}, status_code=403)
 
     url = data["u"]
     audio = bool(data.get("a"))
     quality = data.get("q") or None
     meta = _extract(url, audio, quality)
     if not meta:
-        return JSONResponse({"error": "resolve failed"}, status_code=502)
+        return JSONResponse({"error": "Resolve failed or video limits exceeded"}, status_code=502)
 
-    filename = _safe_name(meta["title"], meta["ext"])
-    disposition = _disposition(filename)
+    if audio:
+        return JSONResponse({"error": "Audio tunnel downloads are not available"}, status_code=422)
 
-    # Progressive http(s) video → proxy with Range passthrough (seekable preview).
-    # If the CDN rejects this box (signed-URL 403, TLS reset) or the request
-    # errors, fall through to the yt-dlp pipe instead of surfacing a 500.
-    if meta["progressive"] and meta["direct"]:
-        try:
-            range_header = request.headers.get("range")
-            fwd = dict(meta["headers"])
-            if range_header:
-                fwd["Range"] = range_header
-            # Stream the media DIRECT first (no proxy). The signed CDN URL usually
-            # serves globally even when the *webpage* is geo-gated, so the big
-            # payload costs zero metered-proxy bandwidth — only extraction (tiny)
-            # needs the proxy. Fall back to the proxy only if the CDN itself
-            # rejects this box (geo-locked media), so metered bytes are spent only
-            # when genuinely required.
-            def _open(via_proxy: bool):
-                proxies = {"http": PROXY, "https": PROXY} if (via_proxy and PROXY) else None
-                return requests.get(
-                    meta["direct"], headers=fwd, stream=True, timeout=30, proxies=proxies
-                )
+    try:
+        file_path, temp_dir = _download_limited_file(url, quality)
+    except Exception as error:
+        return JSONResponse({"error": str(error)}, status_code=422)
 
-            upstream = _open(via_proxy=False)
-            if upstream.status_code >= 400 and PROXY:
-                upstream.close()
-                upstream = _open(via_proxy=True)
-            if upstream.status_code < 400:
-                headers = {
-                    **_CORS,
-                    "Content-Disposition": disposition,
-                    "Content-Type": upstream.headers.get("content-type", "video/mp4"),
-                    "Accept-Ranges": "bytes",
-                }
-                for h in ("content-length", "content-range"):
-                    if h in upstream.headers:
-                        headers[h.title()] = upstream.headers[h]
-                return StreamingResponse(
-                    upstream.iter_content(chunk_size=65536),
-                    status_code=upstream.status_code,
-                    headers=headers,
-                )
-            upstream.close()
-        except Exception:
-            pass  # fall through to the pipe path below
-
-    # Audio, or non-progressive video → pipe through yt-dlp.
-    ctype = "audio/mpeg" if audio else "video/mp4"
-    return StreamingResponse(
-        _pipe(url, audio, quality),
-        media_type=ctype,
-        headers={**_CORS, "Content-Disposition": disposition},
+    return FileResponse(
+        file_path,
+        media_type="video/mp4",
+        filename=_safe_name(meta["title"], "mp4"),
+        background=BackgroundTask(shutil.rmtree, temp_dir, True),
     )

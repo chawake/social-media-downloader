@@ -120,10 +120,17 @@ def _format_for(audio: bool, quality: Optional[str]) -> str:
         return "bestaudio/best"
     if quality == "480":
         return (
-            "best[height<=480][ext=mp4][protocol^=http]/"
-            "best[height<=480][protocol^=http]/best[ext=mp4]/best"
+            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=480]+bestaudio/"
+            "best[height<=480][ext=mp4]/"
+            "best[height<=480]/best"
         )
-    return "best[ext=mp4][protocol^=http]/best[protocol^=http]/best[ext=mp4]/best"
+    return (
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+        "bestvideo+bestaudio/"
+        "best[ext=mp4]/"
+        "best"
+    )
 
 
 def _sign(payload: dict) -> str:
@@ -296,7 +303,7 @@ async def extract_video(request: Request) -> JSONResponse:
     quality = (body or {}).get("videoQuality")
 
     meta = _extract(url, audio, quality)
-    if not meta or (not meta["direct"] and not meta["progressive"] and not audio):
+    if not meta:
         error_msg = _LAST_ERR or "Could not resolve video stream"
         error = {"code": _LAST_ERROR_CODE or "resolution_failed", "message": error_msg}
         if _LAST_ERROR_DURATION:

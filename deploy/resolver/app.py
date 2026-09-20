@@ -48,6 +48,9 @@ ALLOWED_SOURCE_HOSTS = {
     "instagram.com",
     "youtube.com",
     "youtu.be",
+    "facebook.com",
+    "fb.watch",
+    "fb.com",
 }
 
 BASE_URL = (
@@ -191,7 +194,7 @@ def _validate_source_url(url: str) -> Optional[str]:
         return "Only HTTPS source URLs are supported"
 
     if not any(host == allowed or host.endswith(f".{allowed}") for allowed in ALLOWED_SOURCE_HOSTS):
-        return "Only public TikTok, Instagram, and YouTube URLs are supported"
+        return "Only public TikTok, Instagram, YouTube, and Facebook URLs are supported"
 
     try:
         addresses = {record[4][0] for record in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
